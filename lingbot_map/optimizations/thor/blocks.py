@@ -34,6 +34,8 @@ def forward(
     is_streaming = (kv_cache is not None and (num_frames is None or num_frames <= 1))
     if is_streaming:
         manager = kv_cache
+        if getattr(manager, '_skip_append', False) or getattr(manager, '_defer_eviction', False):
+            raise RuntimeError("Thor streaming requires every frame to append; dynamic keyframes are unsupported")
         # Compiled: norm1 + qkv linear + reshape + q_norm + k_norm + RoPE + format
         q_nhd, k_nhd, v_nhd = self.attn_pre(x, pos=pos, enable_3d_rope=enable_3d_rope)
 
@@ -42,41 +44,25 @@ def forward(
         # captured graph), and the writes here are tensor-driven so they're
         # safe to record into a ``torch.cuda.graph``.
         if getattr(manager, '_graph_mode', False):
-            if getattr(manager, '_skip_append', False) or getattr(manager, '_defer_eviction', False):
-                raise RuntimeError("Captured Thor streaming requires every frame to append; dynamic keyframes are unsupported")
             manager.append_frame_graph(global_idx, k_nhd, v_nhd)
             attn_x = manager.compute_attention_graph(global_idx, q_nhd)
             x = self.attn_post_ffn(x, attn_x)
             return x
 
-        # Non-keyframe path: attend to cache+current but don't persist the
-        # current frame.  FlashInfer paged attention can only read from the
-        # paged cache, so we temporarily append (with eviction deferred so
-        # it stays clean), attend, and then roll back the append.  Mirrors
-        # the ``skip_append`` behavior of the SDPA dict path.
-        skip_append = getattr(manager, '_skip_append', False)
-        if skip_append:
-            prev_defer = manager._defer_eviction
-            manager._defer_eviction = True
-            manager.append_frame(global_idx, k_nhd, v_nhd)
-            attn_x = manager.compute_attention(global_idx, q_nhd)
-            manager.rollback_last_frame(global_idx)
-            manager._defer_eviction = prev_defer
-        else:
-            # Eager: write frame K/V to paged cache
-            manager.append_frame(global_idx, k_nhd, v_nhd)
-            # CPU-only: update eviction state (deque ops, no GPU kernel)
-            manager.evict_frames(
-                block_idx=global_idx,
-                scale_frames=self.attn.kv_cache_scale_frames,
-                sliding_window=self.attn.kv_cache_sliding_window,
-                cross_frame_special=self.attn.kv_cache_cross_frame_special,
-                include_scale_frames=self.attn.kv_cache_include_scale_frames,
-                camera_only=self.attn.kv_cache_camera_only,
-                num_register_tokens=num_register_tokens,
-            )
-            # Eager: FlashInfer BatchPrefillWithPagedKVCacheWrapper
-            attn_x = manager.compute_attention(global_idx, q_nhd)
+        # Eager: write frame K/V to paged cache
+        manager.append_frame(global_idx, k_nhd, v_nhd)
+        # CPU-only: update eviction state (deque ops, no GPU kernel)
+        manager.evict_frames(
+            block_idx=global_idx,
+            scale_frames=self.attn.kv_cache_scale_frames,
+            sliding_window=self.attn.kv_cache_sliding_window,
+            cross_frame_special=self.attn.kv_cache_cross_frame_special,
+            include_scale_frames=self.attn.kv_cache_include_scale_frames,
+            camera_only=self.attn.kv_cache_camera_only,
+            num_register_tokens=num_register_tokens,
+        )
+        # Eager: FlashInfer BatchPrefillWithPagedKVCacheWrapper
+        attn_x = manager.compute_attention(global_idx, q_nhd)
 
         # The installed runtime compiles this projection/residual/FFN region.
         x = self.attn_post_ffn(x, attn_x)

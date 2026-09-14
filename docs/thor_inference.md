@@ -82,6 +82,8 @@ when changing FA4 or optimization options.
 All six switches default to off. The optional `--visible-window 56` additionally
 requires `--allow-approximate`; it is not part of the lossless result above.
 It changes attention visibility, not the physical 64-page patch allocation.
+The Thor runtime appends every frame; dynamic keyframes and deferred appends
+raise an error before cache writes.
 
 ## Reproduction
 

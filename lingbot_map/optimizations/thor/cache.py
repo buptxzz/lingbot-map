@@ -31,11 +31,13 @@ Attention computation:
     same frame step have identical page structures (same page IDs in same
     positions), so reusing the plan across layers is correct.
 
-Public API is drop-in compatible with the previous FlashInferKVCacheManager:
+Public API follows the previous FlashInferKVCacheManager for every-frame append:
     append_frame(block_idx, k, v)
     evict_frames(block_idx, scale_frames, sliding_window, ...)
     compute_attention(block_idx, q) -> out
     reset()
+
+Dynamic keyframes and deferred appends are rejected before cache mutation.
 """
 
 import collections
@@ -299,9 +301,7 @@ class FlashInferKVCacheManager(BaseFlashInferKVCacheManager):
         # Frame counter per block (determines scale vs window routing)
         self.frame_count: List[int] = [0] * num_blocks
 
-        # Deferred eviction support for flow-based keyframe selection.
-        # When True, evict_frames() becomes a no-op; caller must later call
-        # execute_deferred_eviction() or rollback_last_frame().
+        # Retain the upstream policy flag so unsupported appends can be rejected.
         self._defer_eviction: bool = False
 
         # ── Attention wrapper ────────────────────────────────────────────────
@@ -739,8 +739,14 @@ class FlashInferKVCacheManager(BaseFlashInferKVCacheManager):
             )
 
     # =========================================================================
-    # Public API  (drop-in compatible with previous FlashInferKVCacheManager)
+    # Public API  (every-frame append only)
     # =========================================================================
+
+    def _validate_append_policy(self) -> None:
+        if getattr(self, "_skip_append", False) or self._defer_eviction:
+            raise RuntimeError(
+                "Thor streaming requires every frame to append; dynamic keyframes are unsupported"
+            )
 
     def append_frame(self, block_idx: int, k: Tensor, v: Tensor) -> None:
         """
@@ -754,6 +760,7 @@ class FlashInferKVCacheManager(BaseFlashInferKVCacheManager):
             k: [tokens_per_frame, H, D]  NHD layout.
             v: [tokens_per_frame, H, D]  NHD layout.
         """
+        self._validate_append_policy()
         n = self.num_special_tokens  # 6
         sp_k    = k[:n].to(self.dtype)      # [6,   H, D]
         patch_k = k[n:].to(self.dtype)     # [256, H, D]
@@ -1075,6 +1082,7 @@ class FlashInferKVCacheManager(BaseFlashInferKVCacheManager):
         """
         if not self._graph_mode:
             raise RuntimeError("prepare_frame_for_graph requires _graph_mode=True")
+        self._validate_append_policy()
         self._validate_candidate021_direct_manager_buffers()
 
         sw  = self.sliding_window
@@ -1089,10 +1097,6 @@ class FlashInferKVCacheManager(BaseFlashInferKVCacheManager):
                 route_errors.append(
                     f"frame_idx={frame_idx}, expected graph streaming frame >= {sf}"
                 )
-            if getattr(self, "_skip_append", False):
-                route_errors.append("_skip_append must be false")
-            if self._defer_eviction:
-                route_errors.append("_defer_eviction must be false")
             if route_errors:
                 raise RuntimeError(
                     "Candidate 021C2 graph prepare rejected: "
@@ -1241,6 +1245,7 @@ class FlashInferKVCacheManager(BaseFlashInferKVCacheManager):
             k, v: [tokens_per_frame, H, D]  NHD layout.  Specials live at
                   positions [0, num_special_tokens); patches at the rest.
         """
+        self._validate_append_policy()
         n = self.num_special_tokens
         P = self.patches_per_frame
 
@@ -1256,10 +1261,6 @@ class FlashInferKVCacheManager(BaseFlashInferKVCacheManager):
                 route_errors.append(
                     f"block_idx={block_idx!r}, expected integer in [0,{self.num_blocks})"
                 )
-            if getattr(self, "_skip_append", False):
-                route_errors.append("_skip_append must be false")
-            if self._defer_eviction:
-                route_errors.append("_defer_eviction must be false")
             if route_errors:
                 raise RuntimeError(
                     "Candidate 021C2 graph append rejected: "
